@@ -1,0 +1,206 @@
+const pool   = require('../config/db');
+const bcrypt = require('bcryptjs');
+const jwt    = require('jsonwebtoken');
+require('dotenv').config();
+
+function makeToken(user) {
+  return jwt.sign(
+    { id: user.id, email: user.email, name: user.name },
+    process.env.JWT_SECRET || 'secret',
+    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+  );
+}
+
+// POST /api/auth/register
+exports.register = async (req, res, next) => {
+  try {
+    const { name, email, password, phone, location, bio } = req.body;
+    if (!name || !email || !password)
+      return res.status(400).json({ success: false, message: 'name, email and password are required' });
+
+    const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
+    if (exists.rows.length > 0)
+      return res.status(409).json({ success: false, message: 'Email already registered' });
+
+    const hash = await bcrypt.hash(password, 10);
+    const r = await pool.query(
+      `INSERT INTO users (name, email, password_hash, phone, location, bio)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, name, email, phone, location, bio, created_at`,
+      [name, email, hash, phone || null, location || null, bio || null]
+    );
+    const user = r.rows[0];
+    res.status(201).json({ success: true, token: makeToken(user), user });
+  } catch (err) { next(err); }
+};
+
+// POST /api/auth/login
+exports.login = async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ success: false, message: 'Email and password required' });
+
+    const r = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
+   
+    
+    const user = r.rows[0];
+    //  console.log(bcrypt.compare(password, user.password_hash));
+    // console.log(password);
+    // console.log(user.password_hash);
+    // const hash = await bcrypt.hash(password, 10);
+    // console.log(hash);
+    
+    if (!user || !(await bcrypt.compare(password, user.password_hash)))
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+    const { password_hash, ...safe } = user;
+    res.json({ success: true, token: makeToken(user), user: safe });
+  } catch (err) { next(err); }
+};
+
+// GET /api/auth/me
+exports.me = async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, name, email, phone, avatar_url, bio, location, total_rides, total_km, created_at
+       FROM users WHERE id=$1`, [req.user.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ success: false, message: 'User not found' });
+    res.json({ success: true, user: r.rows[0] });
+  } catch (err) { next(err); }
+};
+
+// PUT /api/auth/me
+exports.updateMe = async (req, res, next) => {
+  try {
+    const { name, phone, bio, location, avatar_url } = req.body;
+    const r = await pool.query(
+      `UPDATE users SET name=COALESCE($1,name), phone=COALESCE($2,phone),
+        bio=COALESCE($3,bio), location=COALESCE($4,location),
+        avatar_url=COALESCE($5,avatar_url), updated_at=NOW()
+       WHERE id=$6
+       RETURNING id, name, email, phone, avatar_url, bio, location, total_rides, total_km`,
+      [name, phone, bio, location, avatar_url, req.user.id]
+    );
+    res.json({ success: true, user: r.rows[0] });
+  } catch (err) { next(err); }
+};
+
+// GET /api/v1/auth/users/search?q=&limit=
+exports.searchUsers = async (req, res, next) => {
+  try {
+    const { q = '', limit = 50 } = req.query;
+    const trimmed = String(q).trim();
+    const lim = Math.min(parseInt(limit) || 50, 100);
+    let r;
+    if (!trimmed) {
+      r = await pool.query(`
+        SELECT u.id, u.name, u.email, u.avatar_url, u.location, u.total_rides, u.bio,
+               v.name AS bike_name, v.brand AS bike_brand, v.model AS bike_model
+        FROM users u
+        LEFT JOIN vehicles v ON v.user_id = u.id AND v.is_primary = TRUE
+        WHERE u.id != $1 AND u.is_active = TRUE
+        ORDER BY u.total_rides DESC, u.name ASC LIMIT $2
+      `, [req.user.id, lim]);
+    } else {
+      const pat = `%${trimmed}%`;
+      r = await pool.query(`
+        SELECT u.id, u.name, u.email, u.avatar_url, u.location, u.total_rides, u.bio,
+               v.name AS bike_name, v.brand AS bike_brand, v.model AS bike_model
+        FROM users u
+        LEFT JOIN vehicles v ON v.user_id = u.id AND v.is_primary = TRUE
+        WHERE (u.name ILIKE $1 OR u.email ILIKE $1)
+          AND u.id != $2 AND u.is_active = TRUE
+        ORDER BY u.total_rides DESC, u.name ASC LIMIT $3
+      `, [pat, req.user.id, lim]);
+    }
+    res.json({ success: true, users: r.rows });
+  } catch (err) { next(err); }
+};
+
+// POST /api/v1/auth/interests  — save user riding interests
+exports.saveInterests = async (req, res, next) => {
+  try {
+    const { interests } = req.body;
+    if (!Array.isArray(interests) || interests.length === 0)
+      return res.status(400).json({ success: false, message: 'interests array required' });
+
+    // Upsert: delete old, insert new
+    await pool.query('DELETE FROM public.user_interests WHERE user_id=$1', [req.user.id]);
+    for (const interest of interests) {
+      await pool.query(
+        'INSERT INTO public.user_interests (user_id, interest) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+        [req.user.id, interest]
+      );
+    }
+    res.json({ success: true, message: 'Interests saved', count: interests.length });
+  } catch (err) { next(err); }
+};
+
+// GET /api/v1/auth/interests
+exports.getInterests = async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      'SELECT interest FROM public.user_interests WHERE user_id=$1 ORDER BY created_at',
+      [req.user.id]
+    );
+    res.json({ success: true, interests: r.rows.map(row => row.interest) });
+  } catch (err) { next(err); }
+};
+
+// GET /api/v1/auth/profile-summary
+// Returns aggregated profile data for the SidebarProfileScreen
+exports.profileSummary = async (req, res, next) => {
+  try {
+    const uid = req.user.id;
+
+    // Run all counts in parallel for performance
+    const [userRes, bikeRes, groupRes, spentRes, accRes] = await Promise.all([
+      // Base user profile
+      pool.query(
+        `SELECT id, name, location, avatar_url, cover_url, total_rides, total_km,
+                emergency_contact
+         FROM users WHERE id = $1`,
+        [uid]
+      ),
+      // Bike count
+      pool.query(`SELECT COUNT(*) AS cnt FROM vehicles WHERE user_id = $1`, [uid]),
+      // Group count
+      pool.query(
+        `SELECT COUNT(*) AS cnt FROM group_members WHERE user_id = $1 AND status = 'active'`,
+        [uid]
+      ),
+      // Total expenses spent
+      pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE user_id = $1`,
+        [uid]
+      ),
+      // Accessory / marketplace listing count
+      pool.query(
+        `SELECT COUNT(*) AS cnt FROM marketplace_listings WHERE seller_id = $1`,
+        [uid]
+      ).catch(() => ({ rows: [{ cnt: 0 }] })), // table may not exist yet
+    ]);
+
+    const user = userRes.rows[0];
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    res.json({
+      success: true,
+      data: {
+        id:              user.id,
+        name:            user.name,
+        location:        user.location      ?? null,
+        avatar_url:      user.avatar_url    ?? null,
+        cover_url:       user.cover_url     ?? null,
+        total_rides:     user.total_rides   ?? 0,
+        total_km:        parseFloat(user.total_km) || 0,
+        bike_count:      parseInt(bikeRes.rows[0].cnt)  || 0,
+        group_count:     parseInt(groupRes.rows[0].cnt) || 0,
+        total_spent:     parseFloat(spentRes.rows[0].total) || 0,
+        accessory_count: parseInt(accRes.rows[0].cnt)   || 0,
+        has_emergency_contact: !!user.emergency_contact,
+      },
+    });
+  } catch (err) { next(err); }
+};
